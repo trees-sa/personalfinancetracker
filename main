@@ -1,0 +1,270 @@
+import com.sun.net.httpserver.*;
+import java.io.*;
+import java.net.*;
+import java.nio.charset.StandardCharsets;
+import java.security.*;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import javax.crypto.SecretKeyFactory;
+import javax.crypto.spec.PBEKeySpec;
+
+public class FinanceTracker {
+    static class Rec implements Serializable { String id = UUID.randomUUID().toString(), person, date, cat, desc; double amt; }
+    static class Goal implements Serializable { String id = UUID.randomUUID().toString(), person, name; double target, saved; }
+    static class User implements Serializable {
+        String name; byte[] salt, hash;
+        List<String> people = new ArrayList<>();
+        List<Rec> exp = new ArrayList<>(), inc = new ArrayList<>();
+        List<Goal> goals = new ArrayList<>();
+        Map<String, Double> budgets = new HashMap<>();
+    }
+
+    static final File DB = new File("data.ser");
+    static Map<String, User> users = new HashMap<>();
+    static Map<String, String> sessions = new ConcurrentHashMap<>();
+    static final String[] EXP_CATS = {"Food", "Travel", "Education", "Shopping", "Rent", "Bills", "Entertainment", "Other"};
+    static final String[] INC_CATS = {"Salary", "Scholarship", "Freelance", "Part-Time", "Allowance", "Other Income"};
+
+    @SuppressWarnings("unchecked")
+    static void load() {
+        if (!DB.exists()) return;
+        try (ObjectInputStream in = new ObjectInputStream(new FileInputStream(DB))) { users = (Map<String, User>) in.readObject(); }
+        catch (Exception e) { System.err.println("Could not load data: " + e); }
+    }
+    static synchronized void save() {
+        try (ObjectOutputStream out = new ObjectOutputStream(new FileOutputStream(DB))) { out.writeObject(users); }
+        catch (IOException e) { System.err.println("Save failed: " + e); }
+    }
+    static byte[] hash(String pw, byte[] salt) throws Exception {
+        return SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(new PBEKeySpec(pw.toCharArray(), salt, 120000, 256)).getEncoded();
+    }
+
+    public static void main(String[] a) throws Exception {
+        load();
+        int port = Integer.parseInt(System.getenv().getOrDefault("PORT", "8080"));
+        HttpServer s = HttpServer.create(new InetSocketAddress(port), 0);
+        s.createContext("/", FinanceTracker::handle);
+        s.start();
+        System.out.println("Finance Tracker running on http://localhost:" + port);
+    }
+
+    static Map<String, String> form(HttpExchange x) throws IOException {
+        Map<String, String> m = new HashMap<>();
+        String b = new String(x.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+        for (String p : b.split("&")) {
+            int i = p.indexOf('=');
+            if (i > 0) m.put(URLDecoder.decode(p.substring(0, i), StandardCharsets.UTF_8), URLDecoder.decode(p.substring(i + 1), StandardCharsets.UTF_8).trim());
+        }
+        return m;
+    }
+    static String sessionUser(HttpExchange x) {
+        String c = x.getRequestHeaders().getFirst("Cookie");
+        if (c == null) return null;
+        for (String p : c.split(";\\s*")) if (p.startsWith("sid=")) return sessions.get(p.substring(4));
+        return null;
+    }
+    static void send(HttpExchange x, int code, String html) throws IOException {
+        byte[] b = html.getBytes(StandardCharsets.UTF_8);
+        x.getResponseHeaders().set("Content-Type", "text/html; charset=utf-8");
+        x.sendResponseHeaders(code, b.length);
+        try (OutputStream o = x.getResponseBody()) { o.write(b); }
+    }
+    static void redirect(HttpExchange x, String to) throws IOException {
+        x.getResponseHeaders().set("Location", to);
+        x.sendResponseHeaders(302, -1);
+        x.close();
+    }
+    static double num(String s) { try { return Math.max(0, Double.parseDouble(s)); } catch (Exception e) { return 0; } }
+    static String esc(String s) { return s == null ? "" : s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;"); }
+    static String money(double d) { return String.format("₹%,.2f", d); }
+
+    static void handle(HttpExchange x) throws IOException {
+        try {
+            String path = x.getRequestURI().getPath(), method = x.getRequestMethod();
+            if (path.equals("/login") || path.equals("/register")) {
+                boolean reg = path.equals("/register");
+                if (method.equals("GET")) { send(x, 200, authPage(reg, "")); return; }
+                Map<String, String> f = form(x);
+                String name = f.getOrDefault("username", "").toLowerCase(), pw = f.getOrDefault("password", "");
+                String err = null;
+                synchronized (FinanceTracker.class) {
+                    if (reg) {
+                        if (!name.matches("[a-z0-9_]{3,20}")) err = "Username: 3-20 letters, numbers or underscore.";
+                        else if (pw.length() < 6) err = "Password must be at least 6 characters.";
+                        else if (users.containsKey(name)) err = "That username is taken.";
+                        else {
+                            User u = new User(); u.name = name; u.salt = new byte[16];
+                            new SecureRandom().nextBytes(u.salt);
+                            u.hash = hash(pw, u.salt); u.people.add(f.getOrDefault("display", name).isEmpty() ? name : f.get("display"));
+                            users.put(name, u); save();
+                        }
+                    } else {
+                        User u = users.get(name);
+                        if (u == null || !MessageDigest.isEqual(u.hash, hash(pw, u.salt))) err = "Invalid username or password.";
+                    }
+                }
+                if (err != null) { send(x, 200, authPage(reg, err)); return; }
+                String sid = UUID.randomUUID().toString() + UUID.randomUUID();
+                sessions.put(sid, name);
+                x.getResponseHeaders().add("Set-Cookie", "sid=" + sid + "; Path=/; HttpOnly; SameSite=Lax");
+                redirect(x, "/"); return;
+            }
+            String uname = sessionUser(x);
+            if (uname == null) { redirect(x, "/login"); return; }
+            User u = users.get(uname);
+            if (path.equals("/logout")) {
+                String c = x.getRequestHeaders().getFirst("Cookie");
+                if (c != null) for (String p : c.split(";\\s*")) if (p.startsWith("sid=")) sessions.remove(p.substring(4));
+                x.getResponseHeaders().add("Set-Cookie", "sid=; Path=/; Max-Age=0");
+                redirect(x, "/login"); return;
+            }
+            if (method.equals("POST")) {
+                Map<String, String> f = form(x);
+                synchronized (FinanceTracker.class) { action(u, path, f); save(); }
+                redirect(x, "/"); return;
+            }
+            send(x, 200, dashboard(u));
+        } catch (Exception e) {
+            e.printStackTrace();
+            send(x, 500, "<h1>Something went wrong</h1>");
+        }
+    }
+
+    static void action(User u, String path, Map<String, String> f) {
+        String person = f.getOrDefault("person", "");
+        switch (path) {
+            case "/people/add" -> { String n = f.getOrDefault("name", ""); if (!n.isEmpty() && !u.people.contains(n)) u.people.add(n); }
+            case "/expense/add" -> {
+                double total = num(f.get("amount"));
+                if (total <= 0) return;
+                List<String> targets = "1".equals(f.get("split")) ? u.people : List.of(person);
+                for (String p : targets) {
+                    if (!u.people.contains(p)) continue;
+                    Rec r = new Rec(); r.person = p; r.date = f.getOrDefault("date", ""); r.cat = f.getOrDefault("cat", "Other");
+                    r.desc = f.getOrDefault("desc", ""); r.amt = total / targets.size(); u.exp.add(r);
+                }
+            }
+            case "/income/add" -> {
+                double amt = num(f.get("amount"));
+                if (amt <= 0 || !u.people.contains(person)) return;
+                Rec r = new Rec(); r.person = person; r.date = f.getOrDefault("date", ""); r.cat = f.getOrDefault("cat", "Other Income");
+                r.desc = f.getOrDefault("desc", ""); r.amt = amt; u.inc.add(r);
+            }
+            case "/goal/add" -> {
+                if (!u.people.contains(person) || f.getOrDefault("name", "").isEmpty()) return;
+                Goal g = new Goal(); g.person = person; g.name = f.get("name"); g.target = num(f.get("target")); g.saved = num(f.get("saved")); u.goals.add(g);
+            }
+            case "/goal/save" -> u.goals.stream().filter(g -> g.id.equals(f.get("id"))).forEach(g -> g.saved += num(f.get("amount")));
+            case "/budget/set" -> { if (u.people.contains(person)) u.budgets.put(person, num(f.get("amount"))); }
+            case "/expense/del" -> u.exp.removeIf(r -> r.id.equals(f.get("id")));
+            case "/income/del" -> u.inc.removeIf(r -> r.id.equals(f.get("id")));
+            case "/goal/del" -> u.goals.removeIf(g -> g.id.equals(f.get("id")));
+        }
+    }
+
+    static String authPage(boolean reg, String err) {
+        return head("Personal Finance Tracker") + "<div class='card auth'><h1>💰 Finance Tracker</h1><h2>" + (reg ? "Create account" : "Log in") + "</h2>"
+            + (err.isEmpty() ? "" : "<p class='err'>" + esc(err) + "</p>")
+            + "<form method='post'><label>Username</label><input name='username' required autofocus>"
+            + (reg ? "<label>Your display name (optional)</label><input name='display'>" : "")
+            + "<label>Password</label><input type='password' name='password' required><button>" + (reg ? "Sign up" : "Log in") + "</button></form>"
+            + "<p>" + (reg ? "Have an account? <a href='/login'>Log in</a>" : "New here? <a href='/register'>Create an account</a>") + "</p></div></body></html>";
+    }
+
+    static String head(String title) {
+        return "<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>" + title + "</title><style>"
+            + ":root{--bg:#f4f6fb;--card:#fff;--tx:#1d2433;--ac:#4f46e5;--bd:#dde1ea}body.dark{--bg:#12151f;--card:#1c2030;--tx:#e8eaf2;--bd:#323852}"
+            + "body{margin:0;font-family:system-ui,sans-serif;background:var(--bg);color:var(--tx)}main{max-width:1000px;margin:auto;padding:16px}"
+            + ".card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:16px;margin:16px 0}.auth{max-width:360px;margin:60px auto}"
+            + "input,select,button{padding:8px;margin:4px 0;border-radius:8px;border:1px solid var(--bd);background:var(--bg);color:var(--tx);font:inherit}"
+            + "form.row input,form.row select{margin-right:6px}button{background:var(--ac);color:#fff;border:0;cursor:pointer}button.x{background:#dc2626;padding:4px 8px}"
+            + ".auth input{display:block;width:100%;box-sizing:border-box}table{width:100%;border-collapse:collapse;display:block;overflow-x:auto}"
+            + "th,td{padding:6px 8px;border-bottom:1px solid var(--bd);text-align:left}.err{color:#dc2626}.good{color:#16a34a}.bad{color:#dc2626}"
+            + ".stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}.stats div{background:var(--bg);padding:10px;border-radius:8px}"
+            + ".stats b{display:block;font-size:1.3em}nav a{margin-right:12px}.top{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap}"
+            + "</style></head><body><script>if(localStorage.dark==='1')document.body.className='dark'</script>";
+    }
+
+    static String opts(List<String> l) {
+        StringBuilder b = new StringBuilder();
+        for (String s : l) b.append("<option>").append(esc(s)).append("</option>");
+        return b.toString();
+    }
+    static String opts(String[] l) { return opts(Arrays.asList(l)); }
+    static String del(String url, String id) {
+        return "<form method='post' action='" + url + "' style='margin:0'><input type='hidden' name='id' value='" + id + "'><button class='x'>✕</button></form>";
+    }
+
+    static String dashboard(User u) {
+        StringBuilder h = new StringBuilder(head("Personal Finance Tracker"));
+        String P = opts(u.people);
+        double tInc = u.inc.stream().mapToDouble(r -> r.amt).sum(), tExp = u.exp.stream().mapToDouble(r -> r.amt).sum();
+        double tBud = u.people.stream().mapToDouble(p -> u.budgets.getOrDefault(p, 0.0)).sum();
+        h.append("<main><div class='top'><h1>💰 Personal Finance Tracker</h1><div><button onclick=\"localStorage.dark=document.body.classList.toggle('dark')?'1':'0'\">🌙 Dark mode</button> ")
+         .append("<span>@").append(esc(u.name)).append("</span> <form method='post' action='/logout' style='display:inline'><button class='x'>Log out</button></form></div></div>");
+
+        // Summary
+        h.append("<div class='card'><h2>📊 Summary</h2><div class='stats'><div>Total Income<b>").append(money(tInc)).append("</b></div><div>Total Expenses<b>").append(money(tExp))
+         .append("</b></div><div>Balance<b class='").append(tInc - tExp >= 0 ? "good" : "bad").append("'>").append(money(tInc - tExp)).append("</b></div><div>Total Budget<b>").append(money(tBud)).append("</b></div></div>")
+         .append("<table><tr><th>Person</th><th>Income</th><th>Expenses</th><th>Balance</th><th>Status</th></tr>");
+        for (String p : u.people) {
+            double i = u.inc.stream().filter(r -> r.person.equals(p)).mapToDouble(r -> r.amt).sum(), e = u.exp.stream().filter(r -> r.person.equals(p)).mapToDouble(r -> r.amt).sum();
+            h.append("<tr><td>").append(esc(p)).append("</td><td>").append(money(i)).append("</td><td>").append(money(e)).append("</td><td>").append(money(i - e))
+             .append("</td><td class='").append(i - e >= 0 ? "good'>Saving" : "bad'>Deficit").append("</td></tr>");
+        }
+        h.append("</table><form class='row' method='post' action='/people/add'><input name='name' placeholder='Add a person to track' required><button>Add person</button></form></div>");
+
+        // Category breakdown
+        h.append("<div class='card'><h2>📂 Expense Breakdown by Category</h2><table><tr><th>Category</th>");
+        for (String p : u.people) h.append("<th>").append(esc(p)).append("</th>");
+        h.append("<th>Total</th></tr>");
+        for (String c : EXP_CATS) {
+            h.append("<tr><td>").append(c).append("</td>"); double t = 0;
+            for (String p : u.people) { double v = u.exp.stream().filter(r -> r.cat.equals(c) && r.person.equals(p)).mapToDouble(r -> r.amt).sum(); t += v; h.append("<td>").append(money(v)).append("</td>"); }
+            h.append("<td><b>").append(money(t)).append("</b></td></tr>");
+        }
+        h.append("</table></div>");
+
+        // Budgets
+        h.append("<div class='card'><h2>📉 Budget vs Spending</h2><table><tr><th>Person</th><th>Budget</th><th>Spent</th><th>Remaining</th><th>Status</th></tr>");
+        for (String p : u.people) {
+            double b = u.budgets.getOrDefault(p, 0.0), e = u.exp.stream().filter(r -> r.person.equals(p)).mapToDouble(r -> r.amt).sum();
+            h.append("<tr><td>").append(esc(p)).append("</td><td>").append(money(b)).append("</td><td>").append(money(e)).append("</td><td>").append(money(b - e))
+             .append("</td><td class='").append(b - e >= 0 ? "good'>Within budget" : "bad'>Over budget").append("</td></tr>");
+        }
+        h.append("</table><form class='row' method='post' action='/budget/set'><select name='person'>").append(P).append("</select><input name='amount' type='number' step='0.01' min='0' placeholder='Monthly budget ₹' required><button>Save budget</button></form></div>");
+
+        // Goals
+        h.append("<div class='card'><h2>🎯 Savings Goals</h2><table><tr><th>Person</th><th>Goal</th><th>Saved / Target</th><th>Progress</th><th>Add</th><th></th></tr>");
+        for (Goal g : u.goals) {
+            double pc = g.target > 0 ? Math.min(100, g.saved * 100 / g.target) : 0;
+            h.append("<tr><td>").append(esc(g.person)).append("</td><td>").append(esc(g.name)).append("</td><td>").append(money(g.saved)).append(" / ").append(money(g.target))
+             .append("</td><td>").append(String.format("%.0f%%", pc)).append("</td><td><form class='row' method='post' action='/goal/save' style='margin:0'><input type='hidden' name='id' value='").append(g.id)
+             .append("'><input name='amount' type='number' step='0.01' min='0' style='width:80px' required><button>+</button></form></td><td>").append(del("/goal/del", g.id)).append("</td></tr>");
+        }
+        h.append("</table><form class='row' method='post' action='/goal/add'><select name='person'>").append(P).append("</select><input name='name' placeholder='Goal name' required>")
+         .append("<input name='target' type='number' step='0.01' min='0' placeholder='Target ₹' required><input name='saved' type='number' step='0.01' min='0' placeholder='Saved so far ₹'><button>Add goal</button></form></div>");
+
+        // Expenses
+        h.append("<div class='card'><h2>💸 Expenses</h2><form class='row' method='post' action='/expense/add'><select name='person'>").append(P).append("</select><input type='date' name='date' required>")
+         .append("<select name='cat'>").append(opts(EXP_CATS)).append("</select><input name='desc' placeholder='Description'><input name='amount' type='number' step='0.01' min='0.01' placeholder='Amount ₹' required>")
+         .append("<label><input type='checkbox' name='split' value='1'> Split equally among everyone</label> <button>Save expense</button></form>")
+         .append(table(u.exp, "/expense/del", false)).append("</div>");
+
+        // Income
+        h.append("<div class='card'><h2>💵 Income</h2><form class='row' method='post' action='/income/add'><select name='person'>").append(P).append("</select><select name='cat'>").append(opts(INC_CATS))
+         .append("</select><input name='desc' placeholder='Source / description'><input type='date' name='date' required><input name='amount' type='number' step='0.01' min='0.01' placeholder='Amount ₹' required><button>Record income</button></form>")
+         .append(table(u.inc, "/income/del", true)).append("</div></main></body></html>");
+        return h.toString();
+    }
+
+    static String table(List<Rec> l, String delUrl, boolean income) {
+        StringBuilder b = new StringBuilder("<table><tr><th>Person</th><th>Date</th><th>Category</th><th>Description</th><th>Amount</th><th></th></tr>");
+        for (int i = l.size() - 1; i >= 0; i--) {
+            Rec r = l.get(i);
+            b.append("<tr><td>").append(esc(r.person)).append("</td><td>").append(esc(r.date)).append("</td><td>").append(esc(r.cat)).append("</td><td>").append(esc(r.desc))
+             .append("</td><td>").append(money(r.amt)).append("</td><td>").append(del(delUrl, r.id)).append("</td></tr>");
+        }
+        return b.append("</table>").toString();
+    }
+}
